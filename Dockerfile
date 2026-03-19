@@ -9,6 +9,7 @@
 # Run (example):
 #   docker run --gpus all -p 8000:8000 \
 #     -v /data/hf-cache:/data/hf-cache \
+#     -v /mnt/r2-voices:/samples \
 #     -e HF_HOME=/data/hf-cache \
 #     -e HF_TOKEN=hf_... \
 #     vibeserver:latest
@@ -58,7 +59,8 @@ COPY app/ /app/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    VIBEVOICE_EXTRA_VOICES_DIR=/samples
 
 EXPOSE 8000
 

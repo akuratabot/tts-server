@@ -88,15 +88,21 @@ docker buildx build \
 docker run --gpus all \
   -p 8000:8000 \
   -v /data/hf-cache:/data/hf-cache \
+  -v /mnt/r2-voices:/samples \
   -e HF_HOME=/data/hf-cache \
   -e HF_TOKEN=hf_YOUR_TOKEN_HERE \
   vibeserver:latest
 ```
 
-On first startup the model weights (~18 GB) are downloaded from HuggingFace
-Hub.  Subsequent starts use the cached weights.  Watch the logs:
+On first startup the server syncs voice files, downloads model weights (~18 GB),
+and then starts accepting requests.  Watch the logs:
 
 ```
+INFO  Starting voice sync …
+INFO  Copying external voice sarah.wav → /app/voices/sarah.wav
+INFO  Overwriting bundled voice alice.wav with external file /samples/alice.wav
+INFO  Voice sync complete: 3 copied, 0 non-audio skipped (source: /samples)
+INFO  Registered 8 voice(s): ['alice', 'echo', 'frank', 'nova', 'onyx', 'sarah', 'shimmer', ...]
 INFO  Initialising VibeVoice model (this may take a few minutes) …
 INFO  Loading VibeVoiceProcessor from vibevoice/VibeVoice-7B …
 INFO  Loading VibeVoiceForConditionalGenerationInference (BF16, CUDA) …
@@ -117,6 +123,7 @@ INFO  Application startup complete.
 | `VIBEVOICE_MODEL_ID` | `vibevoice/VibeVoice-7B` | HuggingFace model ID to load. |
 | `VIBEVOICE_CFG_SCALE` | `1.3` | Classifier-Free Guidance scale. Higher = more faithful to voice prompt; lower = more varied. |
 | `VIBEVOICE_DDPM_STEPS` | `10` | Diffusion inference steps. More steps = higher quality, slower generation. |
+| `VIBEVOICE_EXTRA_VOICES_DIR` | `/samples` | Path to an additional voice directory. Audio files found here are copied into `app/voices/` at startup, overwriting bundled files of the same name. Mount an external volume (e.g. a Cloudflare R2 bucket) at this path. Silently ignored if the path does not exist. |
 | `PORT` | `8000` | Port uvicorn listens on. |
 
 ---
@@ -124,33 +131,56 @@ INFO  Application startup complete.
 ## Voice Presets
 
 VibeVoice uses short WAV audio samples to clone a speaker's voice.  Voice names
-are **fully custom** — the server scans `app/voices/` at startup and uses each
-file's **stem** (filename without extension) as the voice name.
+are **fully custom** — the server uses each audio file's **stem** (filename
+without extension, lowercased) as the voice name.
 
 ```
-app/voices/Alice.wav    →  voice name: "alice"
-app/voices/my-voice.wav →  voice name: "my-voice"
-app/voices/JohnDoe.wav  →  voice name: "johndoe"
+alice.wav    →  voice name: "alice"
+my-voice.wav →  voice name: "my-voice"
+JohnDoe.wav  →  voice name: "johndoe"
 ```
 
-Matching is case-insensitive.  Use `GET /v1/voices` to list what's available at
-runtime.
+Use `GET /v1/voices` to see exactly what voices are registered at runtime.
 
-The repository ships six **silent placeholder WAV files** (`Alice`, `Echo`,
-`Frank`, `Onyx`, `Nova`, `Shimmer`) as a starting point.  Replace or supplement
-them with any names you like.
+### How voices are loaded at startup
 
-### Adding or Replacing Voices
+The server merges voices from two sources on every startup, in this order:
+
+1. **Bundled voices** — audio files baked into the image at `app/voices/`.
+   The repository ships six silent placeholders (`Alice`, `Echo`, `Frank`,
+   `Onyx`, `Nova`, `Shimmer`) as a starting point.
+
+2. **External voices** — audio files found in `VIBEVOICE_EXTRA_VOICES_DIR`
+   (default `/samples`).  Mount any volume at this path — e.g. a Cloudflare R2
+   bucket via a FUSE mount or a Kubernetes `PersistentVolumeClaim`.  Files are
+   **copied to `app/voices/`** so they are on local disk during inference.
+
+Files from the external directory **overwrite** same-named bundled files, so
+you can replace a placeholder by putting a real `alice.wav` in `/samples`.
+
+If `VIBEVOICE_EXTRA_VOICES_DIR` does not exist the server starts normally using
+only the bundled voices — no error is raised.
+
+### Adding voices via the external directory (recommended)
+
+```
+/samples/
+  sarah.wav
+  narrator.wav
+  alice.wav   ← overwrites the bundled placeholder
+```
+
+Mount `/samples` and set `VIBEVOICE_EXTRA_VOICES_DIR=/samples`.  No image
+rebuild needed.
+
+### Adding voices by baking them into the image
 
 1. Record or source a clean speech sample:
    - Format: WAV, MP3, FLAC, M4A, or OGG (24 kHz preferred)
    - Duration: 5–30 seconds of clean speech (no background music)
    - Mono or stereo — the processor converts to mono automatically
-2. Name the file whatever you want the voice to be called (e.g. `sarah.wav`,
-   `narrator.wav`).
-3. Drop it into `app/voices/`.
-4. Rebuild the Docker image — the new name appears automatically in
-   `GET /v1/voices`.
+2. Name the file whatever you want the voice to be called (e.g. `sarah.wav`).
+3. Drop it into `app/voices/` and rebuild the Docker image.
 
 > **Important:** Only use voice samples for which you have the right to use the
 > speaker's voice.  Do not use recordings of real people without their explicit

@@ -2,16 +2,20 @@
 model.py — VibeVoice-7B model loading and inference wrapper.
 
 Responsibilities:
+  - Sync external voice files from VIBEVOICE_EXTRA_VOICES_DIR into the bundled
+    app/voices/ directory at startup, so all voices live on local disk.
   - Load VibeVoiceForConditionalGenerationInference + VibeVoiceProcessor once
     at startup.
-  - Map OpenAI voice names to bundled WAV file paths.
+  - Discover available voices by scanning app/voices/ after the sync.
   - Expose a single generate_speech() function that takes plain-text input and
     returns raw WAV bytes.
   - Provide an asyncio.Lock so the FastAPI layer can serialise requests.
 
-The model is loaded lazily on first import via module-level initialisation,
-which happens when uvicorn starts the worker process.  Any startup error will
-cause the process to exit non-zero (Kubernetes will restart the pod).
+Startup order (all synchronous, before the model loads):
+  1. sync_voices()   — copy from VIBEVOICE_EXTRA_VOICES_DIR → VOICES_DIR
+  2. _build_voice_index() — scan VOICES_DIR to build the name → Path index
+
+Any startup error will cause the process to exit non-zero (Kubernetes restarts).
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import asyncio
 import io
 import logging
 import os
+import shutil
 import traceback
 from pathlib import Path
 
@@ -36,13 +41,72 @@ CFG_SCALE: float = float(os.getenv("VIBEVOICE_CFG_SCALE", "1.3"))
 DDPM_STEPS: int = int(os.getenv("VIBEVOICE_DDPM_STEPS", "10"))
 
 # ---------------------------------------------------------------------------- #
-#  Voice mapping
+#  Voice sync + mapping
 # ---------------------------------------------------------------------------- #
 
 VOICES_DIR = Path(__file__).parent / "voices"
 
+# Extra voices directory — mount a volume here (e.g. backed by Cloudflare R2).
+# Files found here are copied into VOICES_DIR at startup.
+# Mounted files overwrite bundled files of the same name.
+EXTRA_VOICES_DIR = Path(os.getenv("VIBEVOICE_EXTRA_VOICES_DIR", "/samples"))
+
 # Supported audio extensions (what VibeVoice's audio processor can load).
 _AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
+
+
+def sync_voices() -> None:
+    """
+    Copy all audio files from EXTRA_VOICES_DIR into VOICES_DIR.
+
+    - Runs once at module import, before the voice index is built.
+    - EXTRA_VOICES_DIR not existing is silently ignored (mount is optional).
+    - Files in EXTRA_VOICES_DIR overwrite same-named files in VOICES_DIR so
+      that operator-supplied voices replace bundled placeholders.
+    - Non-audio files (e.g. PLACEHOLDER.md) are skipped.
+    """
+    if not EXTRA_VOICES_DIR.exists():
+        logger.info(
+            "Extra voices directory %s not found — skipping external voice sync.",
+            EXTRA_VOICES_DIR,
+        )
+        return
+
+    if not EXTRA_VOICES_DIR.is_dir():
+        logger.warning(
+            "VIBEVOICE_EXTRA_VOICES_DIR=%s exists but is not a directory — skipping.",
+            EXTRA_VOICES_DIR,
+        )
+        return
+
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
+    copied, skipped = 0, 0
+    for src in sorted(EXTRA_VOICES_DIR.iterdir()):
+        if not src.is_file():
+            continue
+        if src.suffix.lower() not in _AUDIO_EXTS:
+            logger.debug("Skipping non-audio file: %s", src.name)
+            skipped += 1
+            continue
+
+        dst = VOICES_DIR / src.name
+        if dst.exists():
+            logger.info(
+                "Overwriting bundled voice %s with external file %s", dst.name, src
+            )
+        else:
+            logger.info("Copying external voice %s → %s", src.name, dst)
+
+        shutil.copy2(src, dst)
+        copied += 1
+
+    logger.info(
+        "Voice sync complete: %d copied, %d non-audio skipped (source: %s)",
+        copied,
+        skipped,
+        EXTRA_VOICES_DIR,
+    )
 
 
 def _build_voice_index() -> dict[str, Path]:
@@ -50,10 +114,10 @@ def _build_voice_index() -> dict[str, Path]:
     Scan VOICES_DIR and return a mapping of lowercase voice name → Path.
 
     The voice name is the filename stem, lowercased.  For example:
-        Alice.wav   → "alice"
+        Alice.wav    → "alice"
         my-voice.wav → "my-voice"
 
-    Called once at module import.
+    Called once at module import, after sync_voices().
     """
     index: dict[str, Path] = {}
     if not VOICES_DIR.is_dir():
@@ -62,11 +126,15 @@ def _build_voice_index() -> dict[str, Path]:
     for p in sorted(VOICES_DIR.iterdir()):
         if p.suffix.lower() in _AUDIO_EXTS:
             index[p.stem.lower()] = p
-    logger.info("Loaded %d voice preset(s): %s", len(index), sorted(index))
+    logger.info("Registered %d voice(s): %s", len(index), sorted(index))
     return index
 
 
-# Built once at startup; refreshed by calling _build_voice_index() again.
+# --- Startup sequence ---
+logger.info("Starting voice sync …")
+sync_voices()
+
+# Built once at startup after sync; all voices are on local disk at this point.
 _VOICE_INDEX: dict[str, Path] = _build_voice_index()
 
 
