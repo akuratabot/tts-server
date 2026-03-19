@@ -87,7 +87,8 @@ docker buildx build \
 ```bash
 docker run --gpus all \
   -p 8000:8000 \
-  -v /data/hf-cache:/root/.cache/huggingface \
+  -v /data/hf-cache:/data/hf-cache \
+  -e HF_HOME=/data/hf-cache \
   -e HF_TOKEN=hf_YOUR_TOKEN_HERE \
   vibeserver:latest
 ```
@@ -111,7 +112,8 @@ INFO  Application startup complete.
 | Variable | Default | Description |
 |---|---|---|
 | `HF_TOKEN` | *(none)* | HuggingFace API token. Required if the model repo is gated. |
-| `HF_HUB_CACHE` | `/root/.cache/huggingface` | Path where model weights are cached. Mount a persistent volume here. |
+| `HF_HOME` | `~/.cache/huggingface` | Base directory for all HuggingFace data (cache, tokens, etc.). **Recommended** — mount a persistent volume at this path. Model weights land at `$HF_HOME/hub`. |
+| `HF_HUB_CACHE` | `$HF_HOME/hub` | Override only the model/dataset cache path. Takes precedence over `HF_HOME` if both are set. |
 | `VIBEVOICE_MODEL_ID` | `vibevoice/VibeVoice-7B` | HuggingFace model ID to load. |
 | `VIBEVOICE_CFG_SCALE` | `1.3` | Classifier-Free Guidance scale. Higher = more faithful to voice prompt; lower = more varied. |
 | `VIBEVOICE_DDPM_STEPS` | `10` | Diffusion inference steps. More steps = higher quality, slower generation. |

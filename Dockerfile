@@ -8,7 +8,8 @@
 #
 # Run (example):
 #   docker run --gpus all -p 8000:8000 \
-#     -v /data/hf-cache:/root/.cache/huggingface \
+#     -v /data/hf-cache:/data/hf-cache \
+#     -e HF_HOME=/data/hf-cache \
 #     -e HF_TOKEN=hf_... \
 #     vibeserver:latest
 
@@ -45,12 +46,18 @@ COPY app/ /app/
 #  Runtime configuration
 # ---------------------------------------------------------------------------- #
 # Model weights are NOT baked in — they are downloaded on first startup into the
-# HuggingFace cache directory.  Mount a persistent volume at
-# /root/.cache/huggingface to avoid re-downloading on every container start.
+# HuggingFace cache directory.  Set HF_HOME at runtime and mount a persistent
+# volume at that path to avoid re-downloading on every container start.
+#
+# Cache path precedence (standard HuggingFace behaviour):
+#   HF_HUB_CACHE  (most specific, overrides everything)
+#   $HF_HOME/hub  (if HF_HOME is set)
+#   ~/.cache/huggingface/hub  (default fallback)
+#
+# Recommended: set HF_HOME (e.g. -e HF_HOME=/data/hf-cache) and mount that path.
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HUB_CACHE=/root/.cache/huggingface \
     PORT=8000
 
 EXPOSE 8000
