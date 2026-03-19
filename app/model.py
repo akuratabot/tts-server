@@ -41,41 +41,64 @@ DDPM_STEPS: int = int(os.getenv("VIBEVOICE_DDPM_STEPS", "10"))
 
 VOICES_DIR = Path(__file__).parent / "voices"
 
-# OpenAI voice name → bundled WAV filename
-VOICE_MAP: dict[str, str] = {
-    "alloy":   "Alice.wav",
-    "echo":    "Echo.wav",
-    "fable":   "Frank.wav",
-    "onyx":    "Onyx.wav",
-    "nova":    "Nova.wav",
-    "shimmer": "Shimmer.wav",
-}
+# Supported audio extensions (what VibeVoice's audio processor can load).
+_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
 
-DEFAULT_VOICE = "alloy"
+
+def _build_voice_index() -> dict[str, Path]:
+    """
+    Scan VOICES_DIR and return a mapping of lowercase voice name → Path.
+
+    The voice name is the filename stem, lowercased.  For example:
+        Alice.wav   → "alice"
+        my-voice.wav → "my-voice"
+
+    Called once at module import.
+    """
+    index: dict[str, Path] = {}
+    if not VOICES_DIR.is_dir():
+        logger.warning("Voices directory not found: %s", VOICES_DIR)
+        return index
+    for p in sorted(VOICES_DIR.iterdir()):
+        if p.suffix.lower() in _AUDIO_EXTS:
+            index[p.stem.lower()] = p
+    logger.info("Loaded %d voice preset(s): %s", len(index), sorted(index))
+    return index
+
+
+# Built once at startup; refreshed by calling _build_voice_index() again.
+_VOICE_INDEX: dict[str, Path] = _build_voice_index()
+
+
+def available_voices() -> list[str]:
+    """Return a sorted list of available voice names (lowercase stems)."""
+    return sorted(_VOICE_INDEX)
 
 
 def resolve_voice_path(voice: str) -> Path | None:
     """
     Return the absolute path to the WAV file for *voice*.
 
-    Falls back to the default voice if *voice* is unknown.
-    Returns None if even the default WAV is missing (triggers prefill-less
-    generation as a last resort).
+    Matching is case-insensitive against the filename stem.  If the requested
+    voice is not found, falls back to the first available voice alphabetically.
+    Returns None only if the voices directory is completely empty (triggers
+    prefill-less generation as a last resort).
     """
-    name = voice.lower() if voice else DEFAULT_VOICE
-    filename = VOICE_MAP.get(name)
-    if filename is None:
-        logger.warning(
-            "Unknown voice %r — falling back to default (%s).", voice, DEFAULT_VOICE
-        )
-        filename = VOICE_MAP[DEFAULT_VOICE]
+    name = (voice or "").strip().lower()
+    path = _VOICE_INDEX.get(name)
 
-    path = VOICES_DIR / filename
-    if not path.exists():
-        logger.error(
-            "Voice WAV file not found at %s — will run without voice cloning.", path
+    if path is None:
+        fallback = next(iter(sorted(_VOICE_INDEX)), None)
+        if fallback is None:
+            logger.error(
+                "No voice WAV files found in %s — running without voice cloning.", VOICES_DIR
+            )
+            return None
+        logger.warning(
+            "Voice %r not found — falling back to %r.", voice, fallback
         )
-        return None
+        path = _VOICE_INDEX[fallback]
+
     return path
 
 
@@ -138,7 +161,7 @@ inference_lock = asyncio.Lock()
 #  Public API
 # ---------------------------------------------------------------------------- #
 
-def generate_speech(text: str, voice: str = DEFAULT_VOICE) -> bytes:
+def generate_speech(text: str, voice: str = "") -> bytes:
     """
     Synthesise *text* with the requested *voice* and return raw WAV bytes.
 

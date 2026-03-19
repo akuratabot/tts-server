@@ -123,29 +123,34 @@ INFO  Application startup complete.
 
 ## Voice Presets
 
-VibeVoice uses short WAV audio samples to clone a speaker's voice.  Six presets
-are bundled in the image under `/app/voices/`, mapped to OpenAI voice names:
+VibeVoice uses short WAV audio samples to clone a speaker's voice.  Voice names
+are **fully custom** — the server scans `app/voices/` at startup and uses each
+file's **stem** (filename without extension) as the voice name.
 
-| OpenAI voice | WAV file | Character |
-|---|---|---|
-| `alloy` | `Alice.wav` | Female, neutral American English |
-| `echo` | `Echo.wav` | Male, neutral American English |
-| `fable` | `Frank.wav` | Male, British English |
-| `onyx` | `Onyx.wav` | Male, deep American English |
-| `nova` | `Nova.wav` | Female, warm American English |
-| `shimmer` | `Shimmer.wav` | Female, soft American English |
+```
+app/voices/Alice.wav    →  voice name: "alice"
+app/voices/my-voice.wav →  voice name: "my-voice"
+app/voices/JohnDoe.wav  →  voice name: "johndoe"
+```
 
-### Replacing Voice Presets
+Matching is case-insensitive.  Use `GET /v1/voices` to list what's available at
+runtime.
 
-The repository ships **silent placeholder WAV files**.  For best quality,
-replace them with real 5–30 second clean speech samples before building the
-image:
+The repository ships six **silent placeholder WAV files** (`Alice`, `Echo`,
+`Frank`, `Onyx`, `Nova`, `Shimmer`) as a starting point.  Replace or supplement
+them with any names you like.
 
-1. Record or source a clean WAV sample (24 kHz, mono or stereo, no background
-   noise or music).
-2. Name it after the voice you want to replace (e.g. `Alice.wav`).
-3. Place it in `app/voices/`.
-4. Rebuild the Docker image.
+### Adding or Replacing Voices
+
+1. Record or source a clean speech sample:
+   - Format: WAV, MP3, FLAC, M4A, or OGG (24 kHz preferred)
+   - Duration: 5–30 seconds of clean speech (no background music)
+   - Mono or stereo — the processor converts to mono automatically
+2. Name the file whatever you want the voice to be called (e.g. `sarah.wav`,
+   `narrator.wav`).
+3. Drop it into `app/voices/`.
+4. Rebuild the Docker image — the new name appears automatically in
+   `GET /v1/voices`.
 
 > **Important:** Only use voice samples for which you have the right to use the
 > speaker's voice.  Do not use recordings of real people without their explicit
@@ -166,7 +171,7 @@ Synthesise text into speech.  Compatible with the
 {
   "model": "vibevoice-7b",
   "input": "Hello, world! This is VibeVoice speaking.",
-  "voice": "alloy"
+  "voice": "alice"
 }
 ```
 
@@ -174,7 +179,7 @@ Synthesise text into speech.  Compatible with the
 |---|---|---|---|
 | `model` | string | yes | Must be `"vibevoice-7b"` |
 | `input` | string | yes | Text to synthesise |
-| `voice` | string | no | `alloy` (default), `echo`, `fable`, `onyx`, `nova`, `shimmer` |
+| `voice` | string | no | Any voice name from `GET /v1/voices`. Defaults to the first available voice alphabetically. Unknown names also fall back to the first available voice. |
 | `response_format` | string | no | Only `"wav"` supported; other values accepted but ignored |
 | `speed` | float | no | Not supported; ignored |
 
@@ -191,6 +196,31 @@ curl -s http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"vibevoice-7b","input":"Hello from VibeVoice!","voice":"nova"}' \
   --output speech.wav
+
+# List available voices first
+curl http://localhost:8000/v1/voices
+```
+
+---
+
+### `GET /v1/voices`
+
+Lists available voice names — the stems of WAV files found in `app/voices/` at
+startup.
+
+```bash
+curl http://localhost:8000/v1/voices
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "alice", "object": "voice"},
+    {"id": "echo",  "object": "voice"},
+    {"id": "frank", "object": "voice"}
+  ]
+}
 ```
 
 ---

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Literal, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
@@ -35,16 +35,16 @@ app = FastAPI(
 #  Request / response schemas
 # ---------------------------------------------------------------------------- #
 
-# Valid OpenAI voice names that we map to VibeVoice presets.
-VoiceName = Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-
-
 class SpeechRequest(BaseModel):
     model: str = Field(..., description="Must be 'vibevoice-7b'.")
     input: str = Field(..., min_length=1, description="Text to synthesise.")
-    voice: VoiceName = Field(
-        default="alloy",
-        description="Voice preset.  Maps to a bundled WAV sample.",
+    voice: str = Field(
+        default="",
+        description=(
+            "Voice name — must match the stem of a WAV file in app/voices/ "
+            "(case-insensitive). Use GET /v1/voices to list available voices. "
+            "Unknown names fall back to the first available voice alphabetically."
+        ),
     )
     response_format: Optional[str] = Field(
         default="wav",
@@ -139,6 +139,22 @@ async def list_models() -> dict:
                 "owned_by": "vibevoice-community",
             }
         ],
+    }
+
+
+@app.get(
+    "/v1/voices",
+    summary="List voices",
+    description=(
+        "Returns the available voice names — the stems of WAV files found in "
+        "app/voices/ at startup. Pass any of these as the `voice` field in "
+        "POST /v1/audio/speech."
+    ),
+)
+async def list_voices() -> dict:
+    return {
+        "object": "list",
+        "data": [{"id": v, "object": "voice"} for v in _model.available_voices()],
     }
 
 
