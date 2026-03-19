@@ -198,8 +198,32 @@ def generate_speech(text: str, voice: str = DEFAULT_VOICE) -> bytes:
     if speech is None:
         raise RuntimeError("VibeVoice returned no speech output for the given input.")
 
-    # Serialise to WAV in memory — avoid any disk I/O.
+    # Serialise to WAV in memory.
+    #
+    # processor.save_audio() delegates to soundfile.write(output_path, ...) without
+    # ever passing format=, so soundfile infers the format from the file extension.
+    # A BytesIO object has no extension → TypeError.  We write the WAV ourselves,
+    # passing format='WAV' explicitly so soundfile works correctly with a BytesIO.
+    import soundfile as sf
+    import numpy as np
+
+    # Normalise to a 1-D float32 numpy array regardless of what the model returns.
+    if isinstance(speech, torch.Tensor):
+        audio_np = speech.float().detach().cpu().numpy()
+    else:
+        audio_np = np.array(speech, dtype=np.float32)
+
+    # Squeeze any leading batch / channel dimensions down to (T,).
+    audio_np = audio_np.squeeze()
+    if audio_np.ndim != 1:
+        raise RuntimeError(
+            f"Unexpected audio shape after squeeze: {audio_np.shape}. "
+            "Expected a 1-D array."
+        )
+
+    sample_rate = getattr(_processor.audio_processor, "sampling_rate", 24000)
+
     buf = io.BytesIO()
-    _processor.save_audio(speech, output_path=buf)
+    sf.write(buf, audio_np, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
     return buf.read()
