@@ -49,8 +49,8 @@ class SpeechRequest(BaseModel):
         ),
     )
     response_format: Optional[str] = Field(
-        default="wav",
-        description="Audio format.  Only 'wav' is supported; other values are ignored.",
+        default="opus",
+        description="Audio format.  Only OGG/Opus is supported; this field is accepted for OpenAI compatibility but ignored.",
     )
     speed: Optional[float] = Field(
         default=None,
@@ -67,8 +67,8 @@ class SpeechRequest(BaseModel):
     response_class=Response,
     responses={
         200: {
-            "content": {"audio/wav": {}},
-            "description": "WAV audio of the synthesised speech.",
+            "content": {"audio/ogg": {}},
+            "description": "OGG/Opus audio of the synthesised speech.",
         },
         422: {"description": "Validation error (e.g. missing `input`)."},
         500: {"description": "Inference error."},
@@ -94,7 +94,7 @@ async def create_speech(request: SpeechRequest) -> Response:
         try:
             # Run the blocking inference in a thread so the event loop stays
             # responsive (allows health checks etc. to complete while waiting).
-            wav_bytes: bytes = await asyncio.to_thread(
+            audio_bytes: bytes = await asyncio.to_thread(
                 _model.generate_speech,
                 text=request.input,
                 voice=request.voice,
@@ -108,18 +108,18 @@ async def create_speech(request: SpeechRequest) -> Response:
 
     elapsed = time.perf_counter() - start
     logger.info(
-        "Speech generated in %.1f s — voice=%s, chars=%d, wav_bytes=%d",
+        "Speech generated in %.1f s — voice=%s, chars=%d, audio_bytes=%d",
         elapsed,
         request.voice,
         len(request.input),
-        len(wav_bytes),
+        len(audio_bytes),
     )
 
     return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
+        content=audio_bytes,
+        media_type="audio/ogg",
         headers={
-            "Content-Disposition": "attachment; filename=speech.wav",
+            "Content-Disposition": "attachment; filename=speech.ogg",
             "X-Generation-Time": f"{elapsed:.3f}",
         },
     )

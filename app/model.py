@@ -308,14 +308,9 @@ def generate_speech(text: str, voice: str = "") -> bytes:
     if speech is None:
         raise RuntimeError("VibeVoice returned no speech output for the given input.")
 
-    # Serialise to WAV in memory.
-    #
-    # processor.save_audio() delegates to soundfile.write(output_path, ...) without
-    # ever passing format=, so soundfile infers the format from the file extension.
-    # A BytesIO object has no extension → TypeError.  We write the WAV ourselves,
-    # passing format='WAV' explicitly so soundfile works correctly with a BytesIO.
-    import soundfile as sf
     import numpy as np
+    import soundfile as sf
+    from pydub import AudioSegment
 
     # Normalise to a 1-D float32 numpy array regardless of what the model returns.
     if isinstance(speech, torch.Tensor):
@@ -333,7 +328,19 @@ def generate_speech(text: str, voice: str = "") -> bytes:
 
     sample_rate = getattr(_processor.audio_processor, "sampling_rate", 24000)
 
-    buf = io.BytesIO()
-    sf.write(buf, audio_np, sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    return buf.read()
+    # Step 1: write float32 PCM to an in-memory WAV buffer.
+    # soundfile requires an explicit format= when writing to BytesIO (no extension
+    # to infer from).
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, audio_np, sample_rate, format="WAV", subtype="PCM_16")
+    wav_buf.seek(0)
+
+    # Step 2: transcode WAV → OGG/Opus via pydub + ffmpeg.
+    # pydub reads the WAV from memory and encodes to OGG (Opus codec) in memory.
+    # Opus at 64 kbps is transparent for speech and universally supported by
+    # Telegram and most web/mobile clients.
+    segment = AudioSegment.from_wav(wav_buf)
+    ogg_buf = io.BytesIO()
+    segment.export(ogg_buf, format="ogg", codec="libopus", bitrate="64k")
+    ogg_buf.seek(0)
+    return ogg_buf.read()

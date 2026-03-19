@@ -210,12 +210,12 @@ Synthesise text into speech.  Compatible with the
 | `model` | string | yes | Must be `"vibevoice-7b"` |
 | `input` | string | yes | Text to synthesise |
 | `voice` | string | no | Any voice name from `GET /v1/voices`. Defaults to the first available voice alphabetically. Unknown names also fall back to the first available voice. |
-| `response_format` | string | no | Only `"wav"` supported; other values accepted but ignored |
+| `response_format` | string | no | Accepted for OpenAI compatibility but ignored — output is always OGG/Opus |
 | `speed` | float | no | Not supported; ignored |
 
 **Response:**
 
-- `200 OK` — `audio/wav` binary body
+- `200 OK` — `audio/ogg` binary body (Opus codec, 64 kbps)
 - `422 Unprocessable Entity` — validation error (missing `input`, wrong `model`)
 - `500 Internal Server Error` — `{"detail": "..."}` on inference failure
 
@@ -225,7 +225,7 @@ Synthesise text into speech.  Compatible with the
 curl -s http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"model":"vibevoice-7b","input":"Hello from VibeVoice!","voice":"nova"}' \
-  --output speech.wav
+  --output speech.ogg
 
 # List available voices first
 curl http://localhost:8000/v1/voices
@@ -335,7 +335,7 @@ format, which VibeServer handles natively.
 |---|---|
 | **No concurrent inference** | Only one TTS request runs at a time. Additional requests queue; they do not receive 503 errors. |
 | **Language** | English and Chinese only. Other languages produce undefined/poor output. |
-| **No streaming audio** | The full WAV file is buffered before the response is sent. Long inputs take proportionally longer. |
+| **No streaming audio** | The full OGG/Opus file is buffered before the response is sent. Long inputs take proportionally longer. |
 | **Max context** | VibeVoice-7B supports up to 32K tokens (~45 minutes of generated audio). Very long `input` strings may be truncated by the model. |
 | **Voice placeholders** | Shipped WAV files are silent placeholders. Replace them with real voice samples before deployment. |
 | **Inference library** | Depends on the community fork [`vibevoice-community/VibeVoice`](https://github.com/vibevoice-community/VibeVoice). The official Microsoft repo removed TTS code in September 2025. |
