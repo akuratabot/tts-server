@@ -1,0 +1,205 @@
+"""
+model.py — VibeVoice-7B model loading and inference wrapper.
+
+Responsibilities:
+  - Load VibeVoiceForConditionalGenerationInference + VibeVoiceProcessor once
+    at startup.
+  - Map OpenAI voice names to bundled WAV file paths.
+  - Expose a single generate_speech() function that takes plain-text input and
+    returns raw WAV bytes.
+  - Provide an asyncio.Lock so the FastAPI layer can serialise requests.
+
+The model is loaded lazily on first import via module-level initialisation,
+which happens when uvicorn starts the worker process.  Any startup error will
+cause the process to exit non-zero (Kubernetes will restart the pod).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import os
+import traceback
+from pathlib import Path
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------- #
+#  Configuration (overridable via environment variables)
+# ---------------------------------------------------------------------------- #
+
+MODEL_ID: str = os.getenv("VIBEVOICE_MODEL_ID", "vibevoice/VibeVoice-7B")
+CFG_SCALE: float = float(os.getenv("VIBEVOICE_CFG_SCALE", "1.3"))
+DDPM_STEPS: int = int(os.getenv("VIBEVOICE_DDPM_STEPS", "10"))
+
+# ---------------------------------------------------------------------------- #
+#  Voice mapping
+# ---------------------------------------------------------------------------- #
+
+VOICES_DIR = Path(__file__).parent / "voices"
+
+# OpenAI voice name → bundled WAV filename
+VOICE_MAP: dict[str, str] = {
+    "alloy":   "Alice.wav",
+    "echo":    "Echo.wav",
+    "fable":   "Frank.wav",
+    "onyx":    "Onyx.wav",
+    "nova":    "Nova.wav",
+    "shimmer": "Shimmer.wav",
+}
+
+DEFAULT_VOICE = "alloy"
+
+
+def resolve_voice_path(voice: str) -> Path | None:
+    """
+    Return the absolute path to the WAV file for *voice*.
+
+    Falls back to the default voice if *voice* is unknown.
+    Returns None if even the default WAV is missing (triggers prefill-less
+    generation as a last resort).
+    """
+    name = voice.lower() if voice else DEFAULT_VOICE
+    filename = VOICE_MAP.get(name)
+    if filename is None:
+        logger.warning(
+            "Unknown voice %r — falling back to default (%s).", voice, DEFAULT_VOICE
+        )
+        filename = VOICE_MAP[DEFAULT_VOICE]
+
+    path = VOICES_DIR / filename
+    if not path.exists():
+        logger.error(
+            "Voice WAV file not found at %s — will run without voice cloning.", path
+        )
+        return None
+    return path
+
+
+# ---------------------------------------------------------------------------- #
+#  Model loading
+# ---------------------------------------------------------------------------- #
+
+def _load_model():
+    """Load processor and model onto GPU (BF16).  Called once at module import."""
+    from vibevoice.modular.modeling_vibevoice_inference import (
+        VibeVoiceForConditionalGenerationInference,
+    )
+    from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+
+    logger.info("Loading VibeVoiceProcessor from %s …", MODEL_ID)
+    processor = VibeVoiceProcessor.from_pretrained(MODEL_ID)
+
+    logger.info(
+        "Loading VibeVoiceForConditionalGenerationInference (BF16, CUDA) …"
+    )
+
+    # Try flash_attention_2 first (optimal on Blackwell); fall back to sdpa.
+    for attn_impl in ("flash_attention_2", "sdpa"):
+        try:
+            model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.bfloat16,
+                device_map="cuda",
+                attn_implementation=attn_impl,
+            )
+            logger.info("Loaded with attn_implementation=%s", attn_impl)
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "attn_implementation=%s failed (%s: %s); trying next …",
+                attn_impl,
+                type(exc).__name__,
+                exc,
+            )
+    else:
+        raise RuntimeError(
+            "Could not load VibeVoice model with any supported attention implementation."
+        )
+
+    model.eval()
+    model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
+    logger.info("Model ready.")
+    return processor, model
+
+
+logger.info("Initialising VibeVoice model (this may take a few minutes) …")
+_processor, _model = _load_model()
+
+# One inference at a time — VibeVoice does not support batching and holding the
+# GPU across concurrent requests would corrupt outputs.
+inference_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------- #
+#  Public API
+# ---------------------------------------------------------------------------- #
+
+def generate_speech(text: str, voice: str = DEFAULT_VOICE) -> bytes:
+    """
+    Synthesise *text* with the requested *voice* and return raw WAV bytes.
+
+    This is a synchronous, blocking function.  Callers must hold
+    *inference_lock* before calling it and release it afterwards — or use
+    asyncio.to_thread() with the lock held in the async layer.
+
+    Args:
+        text:  Plain-text input to synthesise.  Single-speaker only.
+        voice: OpenAI voice name ('alloy', 'echo', 'fable', 'onyx', 'nova',
+               'shimmer').  Defaults to 'alloy'.
+
+    Returns:
+        Raw WAV audio bytes (24 kHz).
+
+    Raises:
+        RuntimeError: if the model produces no speech output.
+    """
+    voice_path = resolve_voice_path(voice)
+    disable_prefill = voice_path is None
+
+    # VibeVoice expects the "Speaker N: text" format.
+    script = f"Speaker 1: {text}\n"
+
+    voice_samples = [str(voice_path)] if not disable_prefill else []
+
+    inputs = _processor(
+        text=[script],
+        voice_samples=[voice_samples],
+        padding=True,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+
+    # Move all tensors to GPU.
+    device = next(_model.parameters()).device
+    inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+    logger.info(
+        "Generating speech: voice=%r, disable_prefill=%s, input_len=%d chars",
+        voice,
+        disable_prefill,
+        len(text),
+    )
+
+    outputs = _model.generate(
+        **inputs,
+        max_new_tokens=None,
+        cfg_scale=CFG_SCALE,
+        tokenizer=_processor.tokenizer,
+        generation_config={"do_sample": False},
+        verbose=False,
+        is_prefill=not disable_prefill,
+    )
+
+    speech = outputs.speech_outputs[0] if outputs.speech_outputs else None
+    if speech is None:
+        raise RuntimeError("VibeVoice returned no speech output for the given input.")
+
+    # Serialise to WAV in memory — avoid any disk I/O.
+    buf = io.BytesIO()
+    _processor.save_audio(speech, output_path=buf)
+    buf.seek(0)
+    return buf.read()

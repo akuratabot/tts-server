@@ -1,0 +1,15 @@
+# Runtime dependencies for VibeServer.
+#
+# NOTE: torch, transformers, numpy, scipy, librosa, accelerate, diffusers, etc.
+# are provided by either:
+#   1. The nvcr.io/nvidia/pytorch:26.02-py3 base image, OR
+#   2. The vibevoice package's own dependency tree (installed separately in the
+#      Dockerfile after this requirements.txt).
+#
+# Only list packages NOT already covered by the above.
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+soundfile>=0.12.1
+huggingface-hub>=0.23.0
+python-multipart>=0.0.9
