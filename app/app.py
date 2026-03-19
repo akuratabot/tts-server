@@ -2,8 +2,10 @@
 app.py — FastAPI application exposing an OpenAI-compatible TTS API.
 
 Endpoints:
-  POST /v1/audio/speech  — synthesise text, return WAV audio
-  GET  /v1/models        — list available models
+  POST /v1/audio/speech   — synthesise text, return WAV audio
+  GET  /v1/models         — list available models
+  GET  /v1/voices         — list registered voice names
+  POST /v1/voices/refresh — re-sync external voices and rebuild the index
 
 The model is loaded at worker startup (see model.py).  All inference requests
 are serialised through model.inference_lock so only one generation runs at a
@@ -146,15 +148,41 @@ async def list_models() -> dict:
     "/v1/voices",
     summary="List voices",
     description=(
-        "Returns the available voice names — the stems of WAV files found in "
-        "app/voices/ at startup. Pass any of these as the `voice` field in "
-        "POST /v1/audio/speech."
+        "Returns the currently registered voice names — the stems of audio files "
+        "in app/voices/. Use POST /v1/voices/refresh to pick up new files without "
+        "restarting the server."
     ),
 )
 async def list_voices() -> dict:
     return {
         "object": "list",
         "data": [{"id": v, "object": "voice"} for v in _model.available_voices()],
+    }
+
+
+@app.post(
+    "/v1/voices/refresh",
+    summary="Refresh voice index",
+    description=(
+        "Re-syncs audio files from VIBEVOICE_EXTRA_VOICES_DIR into app/voices/ "
+        "and rebuilds the voice index. Use this after adding new files to the "
+        "mounted external directory (e.g. a Cloudflare R2 volume) without "
+        "restarting the server. Returns the updated list of registered voices."
+    ),
+)
+async def refresh_voices() -> dict:
+    try:
+        voices = await asyncio.to_thread(_model.refresh_voices)
+    except Exception as exc:
+        logger.error("Voice refresh failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Voice refresh error: {exc}",
+        ) from exc
+
+    return {
+        "object": "list",
+        "data": [{"id": v, "object": "voice"} for v in voices],
     }
 
 

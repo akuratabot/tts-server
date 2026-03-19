@@ -235,8 +235,7 @@ curl http://localhost:8000/v1/voices
 
 ### `GET /v1/voices`
 
-Lists available voice names — the stems of WAV files found in `app/voices/` at
-startup.
+Lists currently registered voice names.
 
 ```bash
 curl http://localhost:8000/v1/voices
@@ -249,6 +248,31 @@ curl http://localhost:8000/v1/voices
     {"id": "alice", "object": "voice"},
     {"id": "echo",  "object": "voice"},
     {"id": "frank", "object": "voice"}
+  ]
+}
+```
+
+---
+
+### `POST /v1/voices/refresh`
+
+Re-syncs audio files from `VIBEVOICE_EXTRA_VOICES_DIR` into `app/voices/` and
+rebuilds the voice index — without restarting the server.
+
+Use this after adding new files to your mounted external volume (e.g. uploading
+a new WAV to Cloudflare R2). Returns the updated voice list.
+
+```bash
+curl -X POST http://localhost:8000/v1/voices/refresh
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "alice",    "object": "voice"},
+    {"id": "echo",     "object": "voice"},
+    {"id": "sarah",    "object": "voice"}
   ]
 }
 ```

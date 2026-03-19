@@ -143,6 +143,25 @@ def available_voices() -> list[str]:
     return sorted(_VOICE_INDEX)
 
 
+def refresh_voices() -> list[str]:
+    """
+    Re-sync external voices and rebuild the voice index in-place.
+
+    Runs sync_voices() then re-scans VOICES_DIR.  Safe to call at any time;
+    does not touch the model or the inference lock.  Returns the updated list
+    of available voice names.
+
+    Called by POST /v1/voices/refresh.
+    """
+    global _VOICE_INDEX
+    logger.info("Voice refresh requested …")
+    sync_voices()
+    _VOICE_INDEX = _build_voice_index()
+    voices = sorted(_VOICE_INDEX)
+    logger.info("Voice refresh complete — %d voice(s) registered.", len(voices))
+    return voices
+
+
 def resolve_voice_path(voice: str) -> Path | None:
     """
     Return the absolute path to the WAV file for *voice*.
