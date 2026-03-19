@@ -25,7 +25,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------- #
-#  Python dependencies
+#  Non-root user (UID/GID 1000)
+#  Matches the restricted namespace security context the pod runs under.
+# ---------------------------------------------------------------------------- #
+RUN groupadd --gid 1000 appuser \
+ && useradd --uid 1000 --gid 1000 --no-create-home --shell /sbin/nologin appuser
+
+# ---------------------------------------------------------------------------- #
+#  Python dependencies  (still root so pip can write to site-packages)
 # ---------------------------------------------------------------------------- #
 WORKDIR /app
 
@@ -42,6 +49,11 @@ RUN pip install --no-cache-dir \
 #  Application code + bundled voice presets
 # ---------------------------------------------------------------------------- #
 COPY app/ /app/
+
+# Give UID 1000 write access to the voices directory so that sync_voices()
+# can copy files in at runtime (and /v1/voices/refresh works without a restart).
+# All other app files remain owned by root and are read-only to the container.
+RUN chown -R 1000:1000 /app/voices
 
 # ---------------------------------------------------------------------------- #
 #  Runtime configuration
@@ -61,6 +73,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
     VIBEVOICE_EXTRA_VOICES_DIR=/samples
+
+USER 1000
 
 EXPOSE 8000
 
