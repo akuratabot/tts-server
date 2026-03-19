@@ -28,8 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #  Non-root user (UID/GID 1000)
 #  Matches the restricted namespace security context the pod runs under.
 # ---------------------------------------------------------------------------- #
-RUN groupadd --gid 1000 appuser \
- && useradd --uid 1000 --gid 1000 --no-create-home --shell /sbin/nologin appuser
+RUN useradd --uid 1000 --gid 1000 --no-create-home --shell /sbin/nologin appuser
 
 # ---------------------------------------------------------------------------- #
 #  Python dependencies  (still root so pip can write to site-packages)
