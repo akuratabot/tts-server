@@ -10,6 +10,7 @@
 #   docker run --gpus all -p 8000:8000 \
 #     -v /data/hf-cache:/data/hf-cache \
 #     -v /mnt/r2-voices:/samples \
+#     -e TTS_API_KEY=your-secret-key \
 #     -e HF_HOME=/data/hf-cache \
 #     -e HF_TOKEN=hf_... \
 #     vibeserver:latest
@@ -24,6 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------- #
+#  Non-root user (UID/GID 1000)
+#  Matches the restricted namespace security context the pod runs under.
+# ---------------------------------------------------------------------------- #
+RUN groupadd --gid 1000 appuser \
+ && useradd --uid 1000 --gid 1000 --no-create-home --shell /sbin/nologin appuser
 
 # ---------------------------------------------------------------------------- #
 #  Python dependencies  (still root so pip can write to site-packages)

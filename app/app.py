@@ -16,16 +16,44 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import secrets
 import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 import model as _model
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------- #
+#  API key authentication
+# ---------------------------------------------------------------------------- #
+
+_API_KEY: str = os.environ.get("TTS_API_KEY", "")
+if not _API_KEY:
+    raise RuntimeError(
+        "TTS_API_KEY environment variable is not set. "
+        "Set it to a secret value before starting the server."
+    )
+
+_api_key_header = APIKeyHeader(name="X-Api-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str | None = Depends(_api_key_header)) -> None:
+    """FastAPI dependency: validates the X-Api-Key header (timing-safe).
+
+    auto_error=False means FastAPI will NOT auto-reject missing headers —
+    this function is solely responsible for enforcing auth and returning the
+    unified 401 response. Do not change auto_error to True.
+    """
+    if api_key is None or not secrets.compare_digest(api_key, _API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 
 app = FastAPI(
     title="VibeServer",
@@ -78,6 +106,7 @@ class SpeechRequest(BaseModel):
         "Synthesise text into speech and return WAV audio.  "
         "Compatible with the OpenAI `POST /v1/audio/speech` endpoint."
     ),
+    dependencies=[Depends(verify_api_key)],
 )
 async def create_speech(request: SpeechRequest) -> Response:
     if request.model != "vibevoice-7b":
@@ -129,6 +158,7 @@ async def create_speech(request: SpeechRequest) -> Response:
     "/v1/models",
     summary="List models",
     description="Returns the list of available models in OpenAI format.",
+    dependencies=[Depends(verify_api_key)],
 )
 async def list_models() -> dict:
     return {
@@ -152,6 +182,7 @@ async def list_models() -> dict:
         "in app/voices/. Use POST /v1/voices/refresh to pick up new files without "
         "restarting the server."
     ),
+    dependencies=[Depends(verify_api_key)],
 )
 async def list_voices() -> dict:
     return {
@@ -169,6 +200,7 @@ async def list_voices() -> dict:
         "mounted external directory (e.g. a Cloudflare R2 volume) without "
         "restarting the server. Returns the updated list of registered voices."
     ),
+    dependencies=[Depends(verify_api_key)],
 )
 async def refresh_voices() -> dict:
     try:
