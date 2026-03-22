@@ -69,3 +69,37 @@ class Job:
 # ---------------------------------------------------------------------------- #
 
 _jobs: dict[str, Job] = {}
+
+
+def submit_job(*, model: str, input: str, voice: str) -> Job:
+    """
+    Create a Job record, register it in the store, and fire a background task.
+
+    Must be called from within a running asyncio event loop (e.g. from a FastAPI
+    route handler or an async test). Returns the Job immediately.
+    """
+    job_id = secrets.token_hex(16)
+    job = Job(
+        job_id=job_id,
+        model=model,
+        input=input,
+        voice=voice,
+        status="queued",
+        created_at=time.time(),
+    )
+    _jobs[job_id] = job
+    # asyncio.ensure_future works whether or not we have a running loop reference,
+    # and is safe to call from sync code that is itself inside a running loop
+    # (e.g. called from an async FastAPI route via a sync helper).
+    job.task = asyncio.ensure_future(_run_job(job))
+    return job
+
+
+def get_job(job_id: str) -> Optional[Job]:
+    """Return the Job for *job_id*, or None if not found."""
+    return _jobs.get(job_id)
+
+
+async def _run_job(job: Job) -> None:
+    """Background coroutine — implemented in Task 3."""
+    pass
