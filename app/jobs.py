@@ -101,5 +101,86 @@ def get_job(job_id: str) -> Optional[Job]:
 
 
 async def _run_job(job: Job) -> None:
-    """Background coroutine — implemented in Task 3."""
-    pass
+    """
+    Background coroutine: acquires the inference lock, runs generate_speech,
+    and writes the result to a temp file.
+
+    Timeout logic:
+    - Checks elapsed time before acquiring the lock (fails fast for stale jobs).
+    - Checks again after acquiring the lock (handles long queue wait).
+    - Uses asyncio.wait_for with the remaining timeout during inference.
+
+    model is imported inside the function body so that test mocks inserted into
+    sys.modules['model'] are picked up at call time, not at module load time.
+    """
+    import model as _model  # late import — allows sys.modules mock in tests
+
+    def _elapsed() -> float:
+        return time.time() - job.created_at
+
+    def _remaining() -> float:
+        return JOB_TIMEOUT - _elapsed()
+
+    # Pre-lock timeout check — fail fast for stale queued jobs.
+    if _remaining() <= 0:
+        job.status = "failed"
+        job.error = "Job timed out before inference could start"
+        logger.warning("Job %s timed out before acquiring lock", job.job_id)
+        return
+
+    async with _model.inference_lock:
+        # Post-lock timeout check — may have waited a long time for the lock.
+        remaining = _remaining()
+        if remaining <= 0:
+            job.status = "failed"
+            job.error = "Job timed out while waiting for inference slot"
+            logger.warning("Job %s timed out after acquiring lock", job.job_id)
+            return
+
+        job.status = "running"
+        job.started_at = time.time()
+        logger.info("Job %s: inference starting (%.1fs remaining)", job.job_id, remaining)
+
+        try:
+            audio_bytes: bytes = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _model.generate_speech,
+                    text=job.input,
+                    voice=job.voice,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            job.status = "failed"
+            job.error = "Inference timed out"
+            logger.error("Job %s: inference timed out", job.job_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            job.status = "failed"
+            job.error = str(exc)
+            logger.error("Job %s: inference failed: %s", job.job_id, exc, exc_info=True)
+            return
+
+    # Write result to a temp file (outside the lock — IO doesn't need the GPU lock).
+    fd, tmp_path = tempfile.mkstemp(suffix=".ogg", prefix=f"tts_job_{job.job_id}_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(audio_bytes)
+        job.result_path = Path(tmp_path)
+        job.status = "done"
+        job.completed_at = time.time()
+        logger.info(
+            "Job %s: done in %.1fs — %d bytes at %s",
+            job.job_id,
+            job.completed_at - job.started_at,
+            len(audio_bytes),
+            tmp_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        job.status = "failed"
+        job.error = f"Failed to write result: {exc}"
+        logger.error("Job %s: failed to write temp file: %s", job.job_id, exc, exc_info=True)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass

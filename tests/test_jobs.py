@@ -96,3 +96,83 @@ def test_get_job_returns_submitted_job():
             job.task.cancel()
 
     asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# _run_job behaviour
+# --------------------------------------------------------------------------- #
+
+def test_run_job_sets_done_on_success():
+    """_run_job transitions queued → running → done and writes a temp file."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model  # mocked by patch_model fixture
+    fake_model.generate_speech.return_value = b"FAKEAUDIO"
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        # Wait one tick for cancellation to propagate.
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "done"
+        assert job.result_path is not None
+        assert job.result_path.exists()
+        assert job.result_path.read_bytes() == b"FAKEAUDIO"
+        assert job.started_at is not None
+        assert job.completed_at is not None
+        job.result_path.unlink(missing_ok=True)
+
+    asyncio.run(_go())
+
+
+def test_run_job_fails_on_inference_error():
+    """_run_job marks status=failed when generate_speech raises."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model
+    fake_model.generate_speech.side_effect = RuntimeError("GPU exploded")
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "failed"
+        assert "GPU exploded" in job.error
+
+    asyncio.run(_go())
+    fake_model.generate_speech.side_effect = None  # reset
+
+
+def test_run_job_fails_when_already_timed_out():
+    """_run_job marks status=failed immediately if job creation is beyond JOB_TIMEOUT."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        # Backdate creation so the job is already expired.
+        job.created_at = time.time() - jobs_module.JOB_TIMEOUT - 1
+        await jobs_module._run_job(job)
+
+        assert job.status == "failed"
+        assert job.error is not None
+
+    asyncio.run(_go())
