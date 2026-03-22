@@ -176,3 +176,59 @@ def test_run_job_fails_when_already_timed_out():
         assert job.error is not None
 
     asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# _cleanup_loop
+# --------------------------------------------------------------------------- #
+
+def test_cleanup_expires_done_job_and_deletes_temp_file():
+    """_cleanup_once deletes result file and marks job expired after RESULT_TTL."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model
+    fake_model.generate_speech.return_value = b"AUDIO"
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="test", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "done"
+        tmp = job.result_path
+        assert tmp.exists()
+
+        # Backdate completed_at so cleanup considers the result expired.
+        job.completed_at = time.time() - jobs_module.RESULT_TTL - 1
+        await jobs_module._cleanup_once()
+
+        assert job.status == "expired"
+        assert not tmp.exists()
+
+    asyncio.run(_go())
+
+
+def test_cleanup_removes_old_failed_job_from_store():
+    """_cleanup_once removes failed jobs older than RESULT_TTL from the dict."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="test", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "failed"
+        job.error = "test failure"
+        # Backdate so cleanup removes it from the store entirely.
+        job.created_at = time.time() - jobs_module.RESULT_TTL - 1
+
+        await jobs_module._cleanup_once()
+        assert jobs_module.get_job(job.job_id) is None
+
+    asyncio.run(_go())

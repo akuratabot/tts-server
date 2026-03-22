@@ -184,3 +184,67 @@ async def _run_job(job: Job) -> None:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+async def _cleanup_once() -> None:
+    """
+    Single pass of the cleanup logic.
+
+    - Expires done jobs whose result file has outlived RESULT_TTL.
+    - Marks timed-out queued/running jobs as failed and cancels their tasks.
+    - Removes old failed/expired jobs from the store to prevent unbounded growth.
+
+    Factored out from _cleanup_loop so tests can call it directly without waiting
+    for the sleep interval.
+
+    Note on age_reference for failed/expired removal: jobs that fail before
+    ever running have no completed_at; their TTL clock starts from created_at,
+    which is intentional — they are removed after RESULT_TTL from creation.
+    """
+    now = time.time()
+    # Snapshot keys to allow safe mutation during iteration.
+    for job_id in list(_jobs):
+        job = _jobs.get(job_id)
+        if job is None:
+            continue
+
+        if job.status in ("queued", "running"):
+            if now - job.created_at > JOB_TIMEOUT:
+                if job.task is not None and not job.task.done():
+                    job.task.cancel()
+                job.status = "failed"
+                job.error = "Job timed out"
+                logger.warning("Job %s timed out during cleanup", job_id)
+
+        elif job.status == "done":
+            if now - (job.completed_at or job.created_at) > RESULT_TTL:
+                if job.result_path is not None:
+                    try:
+                        job.result_path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning("Could not delete %s: %s", job.result_path, exc)
+                job.status = "expired"
+                logger.info("Job %s expired — result deleted", job_id)
+
+        if job.status in ("failed", "expired"):
+            age_reference = job.completed_at or job.created_at
+            if now - age_reference > RESULT_TTL:
+                del _jobs[job_id]
+                logger.debug("Job %s removed from store", job_id)
+
+
+async def _cleanup_loop() -> None:
+    """
+    Periodic cleanup coroutine. Runs every CLEANUP_INTERVAL seconds.
+    Started as an asyncio task from the FastAPI lifespan handler.
+    """
+    logger.info(
+        "Job cleanup loop started (interval=%.0fs, job_timeout=%.0fs, result_ttl=%.0fs)",
+        CLEANUP_INTERVAL, JOB_TIMEOUT, RESULT_TTL,
+    )
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            await _cleanup_once()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Cleanup loop error: %s", exc, exc_info=True)
