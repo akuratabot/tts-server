@@ -37,6 +37,13 @@ def patch_model(monkeypatch):
     monkeypatch.setitem(sys.modules, "jobs", fake_jobs)
     monkeypatch.setitem(sys.modules, "app.jobs", fake_jobs)
 
+    # Pre-load app.app with a valid key so that `import app.app` in
+    # test_missing_api_key_raises_at_import is always a no-op (module cached),
+    # letting the reload-without-key inside pytest.raises actually trigger the guard.
+    with patch.dict(os.environ, {"TTS_API_KEY": "fixture-preload-key"}):
+        import app.app as _app_module  # noqa: PLC0415
+        importlib.reload(_app_module)
+
 
 def make_client(api_key: str = VALID_KEY) -> TestClient:
     """Import app with API_KEY set and return a TestClient."""
