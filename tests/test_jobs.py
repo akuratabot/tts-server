@@ -35,6 +35,13 @@ def patch_model(monkeypatch):
     monkeypatch.setitem(sys.modules, "model", fake_model)
     monkeypatch.setitem(sys.modules, "app.model", fake_model)
 
+    # app/app.py does `import jobs as _jobs_module` at module level (bare name).
+    # Pre-populate sys.modules["jobs"] with the real app.jobs module so that
+    # when app.app is reloaded, the bare `import jobs` hits the cache.
+    import app.jobs as _jobs_real
+    importlib.reload(_jobs_real)
+    monkeypatch.setitem(sys.modules, "jobs", _jobs_real)
+
 
 def make_client(api_key: str = VALID_KEY) -> tuple[TestClient, object]:
     """Reload app with TTS_API_KEY set and return (TestClient, jobs_module).
@@ -232,3 +239,139 @@ def test_cleanup_removes_old_failed_job_from_store():
         assert jobs_module.get_job(job.job_id) is None
 
     asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# HTTP endpoint tests
+# --------------------------------------------------------------------------- #
+
+def test_submit_job_endpoint_returns_queued():
+    """POST /v1/audio/jobs returns 200 with job_id and status=queued."""
+    client, _ = make_client()
+    resp = client.post(
+        "/v1/audio/jobs",
+        json={"model": "vibevoice-7b", "input": "Hello"},
+        headers={"X-Api-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert "job_id" in body
+    assert "created_at" in body
+
+
+def test_submit_job_requires_auth():
+    client, _ = make_client()
+    resp = client.post("/v1/audio/jobs", json={"model": "vibevoice-7b", "input": "Hi"})
+    assert resp.status_code == 401
+
+
+def test_get_job_unknown_returns_404():
+    client, _ = make_client()
+    resp = client.get("/v1/audio/jobs/doesnotexist", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_get_job_requires_auth():
+    client, _ = make_client()
+    resp = client.get("/v1/audio/jobs/someid")
+    assert resp.status_code == 401
+
+
+def test_get_job_queued_returns_202():
+    """GET /v1/audio/jobs/{id} returns 202 while job is queued.
+
+    Job is manually injected into the store (via the jobs_module returned by
+    make_client) rather than submitted via the endpoint, so there is no race
+    between the background task completing and the GET request.
+    """
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-queued-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="queued",
+        created_at=time.time(),
+    )
+    jobs_module._jobs["test-queued-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-queued-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "queued"
+
+
+def test_get_job_done_returns_audio_and_deletes_file():
+    """GET /v1/audio/jobs/{id} returns 200 audio/ogg and deletes the temp file."""
+    import tempfile as _tempfile
+    client, jobs_module = make_client()
+
+    fd, tmp = _tempfile.mkstemp(suffix=".ogg")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"FAKEAUDIO")
+
+        job = jobs_module.Job(
+            job_id="test-done-job",
+            model="vibevoice-7b",
+            input="hello",
+            voice="",
+            status="done",
+            created_at=time.time(),
+            completed_at=time.time(),
+            result_path=Path(tmp),
+        )
+        jobs_module._jobs["test-done-job"] = job
+
+        resp = client.get("/v1/audio/jobs/test-done-job", headers={"X-Api-Key": VALID_KEY})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/ogg"
+        assert resp.content == b"FAKEAUDIO"
+        # Spec: result file is deleted on serve.
+        assert not Path(tmp).exists()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def test_get_job_failed_returns_500():
+    """GET /v1/audio/jobs/{id} returns 500 when job failed."""
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-failed-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="failed",
+        created_at=time.time(),
+        error="something broke",
+    )
+    jobs_module._jobs["test-failed-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-failed-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 500
+    assert resp.json()["status"] == "failed"
+    assert "something broke" in resp.json()["error"]
+
+
+def test_get_job_expired_returns_410():
+    """GET /v1/audio/jobs/{id} returns 410 when job is expired."""
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-expired-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="expired",
+        created_at=time.time(),
+    )
+    jobs_module._jobs["test-expired-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-expired-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 410
+    assert resp.json()["status"] == "expired"

@@ -18,13 +18,24 @@ VALID_KEY = "test-secret-key"
 
 @pytest.fixture(autouse=True)
 def patch_model(monkeypatch):
-    """Prevent model.py from loading ML weights during tests."""
+    """Prevent model.py and jobs.py from loading during tests."""
     fake_model = MagicMock()
     fake_model.inference_lock = __import__("asyncio").Lock()
     fake_model.generate_speech.return_value = b"\x00" * 16
     fake_model.available_voices.return_value = ["test_voice"]
     fake_model.refresh_voices.return_value = ["test_voice"]
     monkeypatch.setitem(sys.modules, "model", fake_model)
+
+    # jobs module is imported at app.py module level; mock it so test_auth.py
+    # reloads don't fail with ModuleNotFoundError.
+    fake_jobs = MagicMock()
+    # _cleanup_loop is called as asyncio.create_task(_cleanup_loop()) in the lifespan
+    # handler — it must return a coroutine, not an async generator.
+    async def _noop_loop():
+        pass
+    fake_jobs._cleanup_loop = _noop_loop
+    monkeypatch.setitem(sys.modules, "jobs", fake_jobs)
+    monkeypatch.setitem(sys.modules, "app.jobs", fake_jobs)
 
 
 def make_client(api_key: str = VALID_KEY) -> TestClient:
