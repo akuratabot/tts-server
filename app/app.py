@@ -15,6 +15,7 @@ time.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import secrets
@@ -27,6 +28,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 import model as _model
+import jobs as _jobs_module  # bare import — app/ is on sys.path
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,27 @@ async def verify_api_key(api_key: str | None = Depends(_api_key_header)) -> None
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the job cleanup loop on startup; cancel it on shutdown."""
+    cleanup_task = asyncio.create_task(_jobs_module._cleanup_loop())
+    logger.info("Job cleanup loop scheduled.")
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Job cleanup loop stopped.")
+
+
 app = FastAPI(
     title="VibeServer",
     description="OpenAI-compatible TTS server backed by VibeVoice-7B.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------- #
@@ -84,6 +103,21 @@ class SpeechRequest(BaseModel):
         default=None,
         description="Playback speed.  Not supported; ignored.",
     )
+
+
+class JobSubmittedResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: float
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------- #
@@ -152,6 +186,133 @@ async def create_speech(request: SpeechRequest) -> Response:
             "X-Generation-Time": f"{elapsed:.3f}",
         },
     )
+
+
+@app.post(
+    "/v1/audio/jobs",
+    response_model=JobSubmittedResponse,
+    status_code=200,
+    summary="Submit background speech job",
+    description=(
+        "Enqueue a TTS generation job and return immediately with a job_id. "
+        "Poll GET /v1/audio/jobs/{job_id} for status or to retrieve the audio."
+    ),
+    dependencies=[Depends(verify_api_key)],
+)
+async def submit_speech_job(request: SpeechRequest) -> JobSubmittedResponse:
+    if request.model != "vibevoice-7b":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported model '{request.model}'. Use 'vibevoice-7b'.",
+        )
+    job = _jobs_module.submit_job(
+        model=request.model,
+        input=request.input,
+        voice=request.voice,
+    )
+    return JobSubmittedResponse(
+        job_id=job.job_id,
+        status=job.status,
+        created_at=job.created_at,
+    )
+
+
+@app.get(
+    "/v1/audio/jobs/{job_id}",
+    summary="Get job status or audio result",
+    description=(
+        "Poll the status of a background job. "
+        "Returns 202 while queued/running, 200 audio/ogg when done (result file deleted after serving), "
+        "500 on failure, 410 if expired, 404 if not found."
+    ),
+    responses={
+        200: {"content": {"audio/ogg": {}}, "description": "Completed audio"},
+        202: {"description": "Job is queued or running"},
+        404: {"description": "Job not found"},
+        410: {"description": "Job result expired"},
+        500: {"description": "Job failed"},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_speech_job(job_id: str) -> Response:
+    job = _jobs_module.get_job(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status == "queued":
+        return Response(
+            content=JobStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                created_at=job.created_at,
+            ).model_dump_json(),
+            status_code=202,
+            media_type="application/json",
+        )
+
+    if job.status == "running":
+        return Response(
+            content=JobStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                created_at=job.created_at,  # required field — must always be passed
+                started_at=job.started_at,
+            ).model_dump_json(),
+            status_code=202,
+            media_type="application/json",
+        )
+
+    if job.status == "done":
+        if job.result_path is None or not job.result_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="Result file missing — job may have been cleaned up prematurely",
+            )
+        audio_bytes = job.result_path.read_bytes()
+        elapsed = (job.completed_at or 0) - (job.started_at or 0)
+        # Delete the temp file immediately after reading — the client now has the data.
+        try:
+            job.result_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not delete result file %s: %s", job.result_path, exc)
+        job.result_path = None
+        # Mark expired so the cleanup loop doesn't try to delete it again.
+        job.status = "expired"
+        return Response(
+            content=audio_bytes,
+            media_type="audio/ogg",
+            headers={
+                "Content-Disposition": "attachment; filename=speech.ogg",
+                "X-Generation-Time": f"{elapsed:.3f}",
+            },
+        )
+
+    if job.status == "failed":
+        return Response(
+            content=JobStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                created_at=job.created_at,
+                error=job.error,
+            ).model_dump_json(),
+            status_code=500,
+            media_type="application/json",
+        )
+
+    if job.status == "expired":
+        return Response(
+            content=JobStatusResponse(
+                job_id=job.job_id,
+                status=job.status,
+                created_at=job.created_at,
+            ).model_dump_json(),
+            status_code=410,
+            media_type="application/json",
+        )
+
+    # Should never reach here.
+    raise HTTPException(status_code=500, detail=f"Unknown job status: {job.status}")
 
 
 @app.get(

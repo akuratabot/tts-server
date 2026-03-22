@@ -30,6 +30,9 @@ replacement for the OpenAI TTS API (`/v1/audio/speech`).
 │  uvicorn :8000  (FastAPI)                                │
 │    ├── POST /v1/audio/speech  ──► asyncio.Lock           │
 │    │                                └► model.generate() │
+│    ├── POST /v1/audio/jobs    ──► jobs.submit_job()      │
+│    │                                └► asyncio.Task     │
+│    ├── GET  /v1/audio/jobs/{id} ──► jobs.get_job()       │
 │    ├── GET  /v1/models                                   │
 │    └── GET  /health                                      │
 │                                                          │
@@ -125,6 +128,9 @@ INFO  Application startup complete.
 | `VIBEVOICE_DDPM_STEPS` | `10` | Diffusion inference steps. More steps = higher quality, slower generation. |
 | `VIBEVOICE_EXTRA_VOICES_DIR` | `/samples` | Path to an additional voice directory. Audio files found here are copied into `app/voices/` at startup, overwriting bundled files of the same name. Mount an external volume (e.g. a Cloudflare R2 bucket) at this path. Silently ignored if the path does not exist. |
 | `PORT` | `8000` | Port uvicorn listens on. |
+| `TTS_JOB_TIMEOUT` | `300` | Seconds before a background job (queued or running) is considered timed out and marked failed. |
+| `TTS_RESULT_TTL` | `3600` | Seconds to keep a completed job's audio file before expiring it. Cleanup runs every `TTS_CLEANUP_INTERVAL` seconds; the file is also deleted immediately when served. |
+| `TTS_CLEANUP_INTERVAL` | `3600` | How often the background cleanup sweep runs (seconds). |
 
 ---
 
@@ -229,6 +235,83 @@ curl -s http://localhost:8000/v1/audio/speech \
 
 # List available voices first
 curl http://localhost:8000/v1/voices
+```
+
+---
+
+### `POST /v1/audio/jobs`
+
+Submit a background TTS generation job. Accepts the same request body as `POST /v1/audio/speech` and returns immediately with a job record. The audio is generated in the background; poll `GET /v1/audio/jobs/{job_id}` for results.
+
+**Request body (JSON):**
+
+```json
+{
+  "model": "vibevoice-7b",
+  "input": "Hello, world!",
+  "voice": "alice"
+}
+```
+
+**Response — `200 OK`:**
+
+```json
+{
+  "job_id": "abc123def456abc123def456abc123de",
+  "status": "queued",
+  "created_at": 1711234567.89
+}
+```
+
+**curl example:**
+
+```bash
+JOB=$(curl -s -X POST http://localhost:8000/v1/audio/jobs \
+  -H "X-Api-Key: $TTS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"vibevoice-7b","input":"Hello from VibeVoice!","voice":"nova"}')
+echo $JOB
+# {"job_id":"abc123...","status":"queued","created_at":...}
+```
+
+---
+
+### `GET /v1/audio/jobs/{job_id}`
+
+Poll the status of a submitted job or retrieve its audio.
+
+| Job status | HTTP status | Response body |
+|---|---|---|
+| `queued` | `202 Accepted` | JSON `{"job_id":...,"status":"queued","created_at":...}` |
+| `running` | `202 Accepted` | JSON `{"job_id":...,"status":"running","started_at":...}` |
+| `done` | `200 OK` | `audio/ogg` binary — result file is deleted after serving |
+| `failed` | `500 Internal Server Error` | JSON `{"job_id":...,"status":"failed","error":"..."}` |
+| `expired` | `410 Gone` | JSON `{"job_id":...,"status":"expired"}` |
+| Unknown ID | `404 Not Found` | JSON `{"detail":"Job not found"}` |
+
+**curl example (poll until done):**
+
+```bash
+JOB_ID=$(echo $JOB | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+
+while true; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "X-Api-Key: $TTS_API_KEY" \
+    http://localhost:8000/v1/audio/jobs/$JOB_ID)
+  if [ "$STATUS" = "200" ]; then
+    curl -s -H "X-Api-Key: $TTS_API_KEY" \
+      http://localhost:8000/v1/audio/jobs/$JOB_ID \
+      --output speech.ogg
+    echo "Downloaded speech.ogg"
+    break
+  elif [ "$STATUS" = "202" ]; then
+    echo "Still processing… (HTTP $STATUS)"
+    sleep 5
+  else
+    echo "Error: HTTP $STATUS"
+    break
+  fi
+done
 ```
 
 ---

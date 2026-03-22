@@ -1,0 +1,377 @@
+# tests/test_jobs.py
+"""tests/test_jobs.py — Background TTS job endpoint tests.
+
+Import conventions:
+- Tests use `import app.jobs as jobs_module` (package-qualified, from repo root).
+- app/app.py uses `import jobs as _jobs_module` (bare name, app/ is on sys.path).
+- make_client() reloads app.app first (rebinds its _jobs_module to the bare-name
+  'jobs' module), then reloads app.jobs. After this sequence both the running app
+  and the test reference the same _jobs dict. Reload order matters — do not swap.
+"""
+import asyncio
+import os
+import importlib
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+VALID_KEY = "test-secret-key"
+
+
+@pytest.fixture(autouse=True)
+def patch_model(monkeypatch):
+    """Prevent model.py from loading ML weights during tests."""
+    fake_model = MagicMock()
+    fake_model.inference_lock = asyncio.Lock()
+    fake_model.generate_speech.return_value = b"\x00" * 64
+    fake_model.available_voices.return_value = ["test_voice"]
+    fake_model.refresh_voices.return_value = ["test_voice"]
+    # Patch both the bare name and the package-qualified name so that
+    # whichever import path is used at runtime, the mock is found.
+    monkeypatch.setitem(sys.modules, "model", fake_model)
+    monkeypatch.setitem(sys.modules, "app.model", fake_model)
+
+    # app/app.py does `import jobs as _jobs_module` at module level (bare name).
+    # Pre-populate sys.modules["jobs"] with the real app.jobs module so that
+    # when app.app is reloaded, the bare `import jobs` hits the cache.
+    import app.jobs as _jobs_real
+    importlib.reload(_jobs_real)
+    monkeypatch.setitem(sys.modules, "jobs", _jobs_real)
+
+
+def make_client(api_key: str = VALID_KEY) -> tuple[TestClient, object]:
+    """Reload app with TTS_API_KEY set and return (TestClient, jobs_module).
+
+    Reload order is critical:
+    1. Reload app.app  — re-executes `import jobs as _jobs_module` inside app.py,
+       binding it to the 'jobs' module object (bare name, loaded via app/ sys.path).
+    2. Reload app.jobs — resets the _jobs dict and all state for a clean test.
+    After both reloads, app._jobs_module and the returned jobs_module share the
+    same underlying module object (sys.modules['jobs'] == sys.modules['app.jobs']).
+    """
+    with patch.dict(os.environ, {"TTS_API_KEY": api_key}):
+        import app.app as app_module
+        importlib.reload(app_module)
+        import app.jobs as jobs_module
+        importlib.reload(jobs_module)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        return client, jobs_module
+
+
+# --------------------------------------------------------------------------- #
+# submit_job / get_job unit tests (no HTTP layer yet)
+# --------------------------------------------------------------------------- #
+
+def test_submit_job_creates_job_record():
+    """submit_job returns a Job with status=queued and a non-empty job_id."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    # submit_job schedules an asyncio task — run inside an event loop.
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        assert job.job_id
+        assert job.status == "queued"
+        assert job.model == "vibevoice-7b"
+        assert job.input == "hello"
+        assert job.created_at > 0
+        if job.task:
+            job.task.cancel()
+
+    asyncio.run(_go())
+
+
+def test_get_job_returns_none_for_unknown():
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    assert jobs_module.get_job("nonexistent") is None
+
+
+def test_get_job_returns_submitted_job():
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hi", voice="")
+        fetched = jobs_module.get_job(job.job_id)
+        assert fetched is job
+        if job.task:
+            job.task.cancel()
+
+    asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# _run_job behaviour
+# --------------------------------------------------------------------------- #
+
+def test_run_job_sets_done_on_success():
+    """_run_job transitions queued → running → done and writes a temp file."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model  # mocked by patch_model fixture
+    fake_model.generate_speech.return_value = b"FAKEAUDIO"
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        # Wait one tick for cancellation to propagate.
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "done"
+        assert job.result_path is not None
+        assert job.result_path.exists()
+        assert job.result_path.read_bytes() == b"FAKEAUDIO"
+        assert job.started_at is not None
+        assert job.completed_at is not None
+        job.result_path.unlink(missing_ok=True)
+
+    asyncio.run(_go())
+
+
+def test_run_job_fails_on_inference_error():
+    """_run_job marks status=failed when generate_speech raises."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model
+    fake_model.generate_speech.side_effect = RuntimeError("GPU exploded")
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "failed"
+        assert "GPU exploded" in job.error
+
+    asyncio.run(_go())
+    fake_model.generate_speech.side_effect = None  # reset
+
+
+def test_run_job_fails_when_already_timed_out():
+    """_run_job marks status=failed immediately if job creation is beyond JOB_TIMEOUT."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="hello", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "queued"
+        job.task = None
+        # Backdate creation so the job is already expired.
+        job.created_at = time.time() - jobs_module.JOB_TIMEOUT - 1
+        await jobs_module._run_job(job)
+
+        assert job.status == "failed"
+        assert job.error is not None
+
+    asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# _cleanup_loop
+# --------------------------------------------------------------------------- #
+
+def test_cleanup_expires_done_job_and_deletes_temp_file():
+    """_cleanup_once deletes result file and marks job expired after RESULT_TTL."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+    import model as fake_model
+    fake_model.generate_speech.return_value = b"AUDIO"
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="test", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+        job.status = "queued"
+        job.task = None
+        await jobs_module._run_job(job)
+
+        assert job.status == "done"
+        tmp = job.result_path
+        assert tmp.exists()
+
+        # Backdate completed_at so cleanup considers the result expired.
+        job.completed_at = time.time() - jobs_module.RESULT_TTL - 1
+        await jobs_module._cleanup_once()
+
+        assert job.status == "expired"
+        assert not tmp.exists()
+
+    asyncio.run(_go())
+
+
+def test_cleanup_removes_old_failed_job_from_store():
+    """_cleanup_once removes failed jobs older than RESULT_TTL from the dict."""
+    import app.jobs as jobs_module
+    importlib.reload(jobs_module)
+
+    async def _go():
+        job = jobs_module.submit_job(model="vibevoice-7b", input="test", voice="")
+        if job.task:
+            job.task.cancel()
+        await asyncio.sleep(0)
+
+        job.status = "failed"
+        job.error = "test failure"
+        # Backdate so cleanup removes it from the store entirely.
+        job.created_at = time.time() - jobs_module.RESULT_TTL - 1
+
+        await jobs_module._cleanup_once()
+        assert jobs_module.get_job(job.job_id) is None
+
+    asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
+# HTTP endpoint tests
+# --------------------------------------------------------------------------- #
+
+def test_submit_job_endpoint_returns_queued():
+    """POST /v1/audio/jobs returns 200 with job_id and status=queued."""
+    client, _ = make_client()
+    resp = client.post(
+        "/v1/audio/jobs",
+        json={"model": "vibevoice-7b", "input": "Hello"},
+        headers={"X-Api-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert "job_id" in body
+    assert "created_at" in body
+
+
+def test_submit_job_requires_auth():
+    client, _ = make_client()
+    resp = client.post("/v1/audio/jobs", json={"model": "vibevoice-7b", "input": "Hi"})
+    assert resp.status_code == 401
+
+
+def test_get_job_unknown_returns_404():
+    client, _ = make_client()
+    resp = client.get("/v1/audio/jobs/doesnotexist", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_get_job_requires_auth():
+    client, _ = make_client()
+    resp = client.get("/v1/audio/jobs/someid")
+    assert resp.status_code == 401
+
+
+def test_get_job_queued_returns_202():
+    """GET /v1/audio/jobs/{id} returns 202 while job is queued.
+
+    Job is manually injected into the store (via the jobs_module returned by
+    make_client) rather than submitted via the endpoint, so there is no race
+    between the background task completing and the GET request.
+    """
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-queued-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="queued",
+        created_at=time.time(),
+    )
+    jobs_module._jobs["test-queued-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-queued-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "queued"
+
+
+def test_get_job_done_returns_audio_and_deletes_file():
+    """GET /v1/audio/jobs/{id} returns 200 audio/ogg and deletes the temp file."""
+    import tempfile as _tempfile
+    client, jobs_module = make_client()
+
+    fd, tmp = _tempfile.mkstemp(suffix=".ogg")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"FAKEAUDIO")
+
+        job = jobs_module.Job(
+            job_id="test-done-job",
+            model="vibevoice-7b",
+            input="hello",
+            voice="",
+            status="done",
+            created_at=time.time(),
+            completed_at=time.time(),
+            result_path=Path(tmp),
+        )
+        jobs_module._jobs["test-done-job"] = job
+
+        resp = client.get("/v1/audio/jobs/test-done-job", headers={"X-Api-Key": VALID_KEY})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "audio/ogg"
+        assert resp.content == b"FAKEAUDIO"
+        # Spec: result file is deleted on serve.
+        assert not Path(tmp).exists()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def test_get_job_failed_returns_500():
+    """GET /v1/audio/jobs/{id} returns 500 when job failed."""
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-failed-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="failed",
+        created_at=time.time(),
+        error="something broke",
+    )
+    jobs_module._jobs["test-failed-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-failed-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 500
+    assert resp.json()["status"] == "failed"
+    assert "something broke" in resp.json()["error"]
+
+
+def test_get_job_expired_returns_410():
+    """GET /v1/audio/jobs/{id} returns 410 when job is expired."""
+    client, jobs_module = make_client()
+
+    job = jobs_module.Job(
+        job_id="test-expired-job",
+        model="vibevoice-7b",
+        input="hello",
+        voice="",
+        status="expired",
+        created_at=time.time(),
+    )
+    jobs_module._jobs["test-expired-job"] = job
+
+    resp = client.get("/v1/audio/jobs/test-expired-job", headers={"X-Api-Key": VALID_KEY})
+    assert resp.status_code == 410
+    assert resp.json()["status"] == "expired"
