@@ -128,3 +128,74 @@ def test_valid_key_passes_auth(method, path, body):
     client = make_client()
     resp = client.request(method, path, json=body, headers={"X-Api-Key": VALID_KEY})
     assert resp.status_code != 401
+
+
+# --------------------------------------------------------------------------- #
+# Authorization: Bearer — valid token → not 401
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("method,path,body", [
+    ("GET",  "/v1/models",  None),
+    ("GET",  "/v1/voices",  None),
+    ("POST", "/v1/voices/refresh", None),
+])
+def test_bearer_token_passes_auth(method, path, body):
+    client = make_client()
+    resp = client.request(
+        method, path, json=body,
+        headers={"Authorization": f"Bearer {VALID_KEY}"},
+    )
+    assert resp.status_code != 401
+
+
+# --------------------------------------------------------------------------- #
+# Authorization: Bearer — wrong token → 401
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("method,path,body", [
+    ("GET",  "/v1/models",  None),
+    ("GET",  "/v1/voices",  None),
+    ("POST", "/v1/voices/refresh", None),
+])
+def test_wrong_bearer_token_returns_401(method, path, body):
+    client = make_client()
+    resp = client.request(
+        method, path, json=body,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Authorization: Bearer — malformed (no token after scheme) → 401
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("method,path,body", [
+    ("GET",  "/v1/models",  None),
+])
+def test_malformed_bearer_returns_401(method, path, body):
+    client = make_client()
+    # "Bearer " with no token, and "NotBearer key" (wrong scheme)
+    for auth_value in ("Bearer ", "Token some-key", "notascheme"):
+        resp = client.request(
+            method, path, json=body,
+            headers={"Authorization": auth_value},
+        )
+        assert resp.status_code == 401, f"Expected 401 for Authorization: {auth_value!r}"
+
+
+# --------------------------------------------------------------------------- #
+# X-Api-Key takes precedence over Authorization: Bearer
+# --------------------------------------------------------------------------- #
+
+def test_x_api_key_takes_precedence_over_bearer():
+    """When both headers are present, X-Api-Key is used (valid key wins)."""
+    client = make_client()
+    resp = client.get(
+        "/v1/models",
+        headers={
+            "X-Api-Key": VALID_KEY,
+            "Authorization": "Bearer wrong-token",
+        },
+    )
+    assert resp.status_code != 401
