@@ -22,7 +22,7 @@ import secrets
 import time
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -46,14 +46,29 @@ if not _API_KEY:
 _api_key_header = APIKeyHeader(name="X-Api-Key", auto_error=False)
 
 
-async def verify_api_key(api_key: str | None = Depends(_api_key_header)) -> None:
-    """FastAPI dependency: validates the X-Api-Key header (timing-safe).
+async def verify_api_key(
+    api_key: str | None = Depends(_api_key_header),
+    authorization: str | None = Header(default=None),
+) -> None:
+    """FastAPI dependency: validates auth via X-Api-Key or Authorization: Bearer (timing-safe).
 
-    auto_error=False means FastAPI will NOT auto-reject missing headers —
-    this function is solely responsible for enforcing auth and returning the
-    unified 401 response. Do not change auto_error to True.
+    Accepts either:
+      - X-Api-Key: <key>
+      - Authorization: Bearer <key>
+
+    X-Api-Key takes precedence. auto_error=False means FastAPI will NOT
+    auto-reject missing headers — this function is solely responsible for
+    enforcing auth and returning the unified 401 response.
     """
-    if api_key is None or not secrets.compare_digest(api_key, _API_KEY):
+    candidate: str | None = api_key
+
+    # Fall back to Bearer token if X-Api-Key was not provided.
+    if candidate is None and authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            candidate = token
+
+    if candidate is None or not secrets.compare_digest(candidate, _API_KEY):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
