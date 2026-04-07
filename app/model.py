@@ -49,6 +49,10 @@ if DTYPE not in _SUPPORTED_DTYPES:
         f"Supported values: {sorted(_SUPPORTED_DTYPES)}"
     )
 
+# fp8 loads to CPU first (quantize on CPU, then move to GPU) so that nodes
+# with limited GPU memory can run the model.  bfloat16 loads directly to GPU.
+_LOAD_DEVICE: str = "cpu" if DTYPE == "fp8" else "cuda"
+
 # ---------------------------------------------------------------------------- #
 #  Voice sync + mapping
 # ---------------------------------------------------------------------------- #
@@ -228,8 +232,10 @@ def _load_model():
     processor = VibeVoiceProcessor.from_pretrained(MODEL_ID)
 
     logger.info(
-        "Loading VibeVoiceForConditionalGenerationInference (BF16→%s, CUDA) …",
+        "Loading VibeVoiceForConditionalGenerationInference "
+        "(BF16→%s, load_device=%s) …",
         DTYPE,
+        _LOAD_DEVICE,
     )
 
     # Try flash_attention_2 first (optimal on Blackwell); fall back to sdpa.
@@ -238,7 +244,7 @@ def _load_model():
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 MODEL_ID,
                 torch_dtype=torch.bfloat16,
-                device_map="cuda",
+                device_map=_LOAD_DEVICE,
                 attn_implementation=attn_impl,
             )
             logger.info("Loaded with attn_implementation=%s", attn_impl)
@@ -256,6 +262,14 @@ def _load_model():
         )
 
     _apply_quantization(model)
+
+    if _LOAD_DEVICE == "cpu":
+        logger.info("Moving quantized model to CUDA …")
+        t0 = time.perf_counter()
+        model.to("cuda")
+        elapsed = time.perf_counter() - t0
+        logger.info("Model moved to CUDA in %.1f s.", elapsed)
+
     model.eval()
     model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
     logger.info("Model ready (dtype=%s).", DTYPE)
