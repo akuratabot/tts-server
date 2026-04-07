@@ -25,6 +25,7 @@ import io
 import logging
 import os
 import shutil
+import time
 import traceback
 from pathlib import Path
 
@@ -39,6 +40,14 @@ logger = logging.getLogger(__name__)
 MODEL_ID: str = os.getenv("VIBEVOICE_MODEL_ID", "vibevoice/VibeVoice-7B")
 CFG_SCALE: float = float(os.getenv("VIBEVOICE_CFG_SCALE", "1.3"))
 DDPM_STEPS: int = int(os.getenv("VIBEVOICE_DDPM_STEPS", "10"))
+DTYPE: str = os.getenv("VIBEVOICE_DTYPE", "bfloat16")
+
+_SUPPORTED_DTYPES = {"bfloat16", "fp8"}
+if DTYPE not in _SUPPORTED_DTYPES:
+    raise RuntimeError(
+        f"Unsupported VIBEVOICE_DTYPE={DTYPE!r}. "
+        f"Supported values: {sorted(_SUPPORTED_DTYPES)}"
+    )
 
 # ---------------------------------------------------------------------------- #
 #  Voice sync + mapping
@@ -178,12 +187,11 @@ def resolve_voice_path(voice: str) -> Path | None:
         fallback = next(iter(sorted(_VOICE_INDEX)), None)
         if fallback is None:
             logger.error(
-                "No voice WAV files found in %s — running without voice cloning.", VOICES_DIR
+                "No voice WAV files found in %s — running without voice cloning.",
+                VOICES_DIR,
             )
             return None
-        logger.warning(
-            "Voice %r not found — falling back to %r.", voice, fallback
-        )
+        logger.warning("Voice %r not found — falling back to %r.", voice, fallback)
         path = _VOICE_INDEX[fallback]
 
     return path
@@ -192,6 +200,22 @@ def resolve_voice_path(voice: str) -> Path | None:
 # ---------------------------------------------------------------------------- #
 #  Model loading
 # ---------------------------------------------------------------------------- #
+
+
+def _apply_quantization(model) -> None:
+    """Apply torchao post-load quantization based on the DTYPE env var."""
+    if DTYPE == "bfloat16":
+        return  # nothing to do
+
+    from torchao.quantization import quantize_, Float8WeightOnlyConfig
+
+    logger.info("Applying torchao quantization: dtype=%s …", DTYPE)
+    t0 = time.perf_counter()
+    if DTYPE == "fp8":
+        quantize_(model, Float8WeightOnlyConfig())
+    elapsed = time.perf_counter() - t0
+    logger.info("Quantization complete in %.1f s.", elapsed)
+
 
 def _load_model():
     """Load processor and model onto GPU (BF16).  Called once at module import."""
@@ -204,7 +228,8 @@ def _load_model():
     processor = VibeVoiceProcessor.from_pretrained(MODEL_ID)
 
     logger.info(
-        "Loading VibeVoiceForConditionalGenerationInference (BF16, CUDA) …"
+        "Loading VibeVoiceForConditionalGenerationInference (BF16→%s, CUDA) …",
+        DTYPE,
     )
 
     # Try flash_attention_2 first (optimal on Blackwell); fall back to sdpa.
@@ -230,9 +255,10 @@ def _load_model():
             "Could not load VibeVoice model with any supported attention implementation."
         )
 
+    _apply_quantization(model)
     model.eval()
     model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
-    logger.info("Model ready.")
+    logger.info("Model ready (dtype=%s).", DTYPE)
     return processor, model
 
 
@@ -247,6 +273,7 @@ inference_lock = asyncio.Lock()
 # ---------------------------------------------------------------------------- #
 #  Public API
 # ---------------------------------------------------------------------------- #
+
 
 def generate_speech(text: str, voice: str = "") -> bytes:
     """
